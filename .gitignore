@@ -22,6 +22,9 @@
 /build
 /dist
 
+# Keep content directory (MDX files)
+!content/
+
 # misc
 .DS_Store
 *.pem

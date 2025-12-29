@@ -1,0 +1,421 @@
+---
+title: "My Homelab SRE Philosophy: How I Design Reliability on Purpose"
+date: "2024-01-22"
+summary: "Applying production SRE principles to homelab infrastructure—defining SLIs/SLOs, building alerting that doesn't wake you up for nothing, and focusing on the monitoring that actually matters."
+tags: ["SRE", "Monitoring", "Homelab", "Reliability"]
+featured: true
+---
+
+# My Homelab SRE Philosophy: How I Design Reliability on Purpose
+
+## Quick Summary
+
+- **Key Point 1**: SLIs/SLOs aren&apos;t just for Google—defining them for homelab services forces clarity about what actually matters
+- **Key Point 2**: Good alerting means pages for things you&apos;ll fix at 2am, info for everything else—mixing these kills on-call sanity
+- **Key Point 3**: The minimum viable monitoring is: availability, latency, errors, and saturation—everything else is optional
+
+## Context
+
+### Background
+
+After running a homelab for three years, I realized I was building infrastructure the way most people cook without measuring—"add some monitoring, seems fine, ship it."
+
+The problem wasn&apos;t that services were unreliable. DNS worked, the reverse proxy routed traffic, Plex streamed movies. The problem was I had no idea _how_ reliable they were, no framework for making tradeoffs, and alerts that either fired constantly or never.
+
+When my DNS server went down at 11pm on a Tuesday, I found out because my phone couldn&apos;t load websites—not from monitoring. That was the wake-up call to treat my homelab infrastructure the way I&apos;d treat production systems at work.
+
+### Requirements
+
+I needed a reliability framework that:
+
+**Business requirements:**
+
+- Clear understanding of actual service reliability
+- Informed decisions about where to invest effort
+- Confidence that critical services would alert when broken
+- Ability to sleep without wondering "is everything ok?"
+
+**Technical requirements:**
+
+- Measurable SLIs for each service
+- Realistic SLOs that drive behavior
+- Alerting that distinguishes critical from informational
+- Monitoring overhead under 5% of system resources
+- Data retention sufficient for trend analysis (30+ days)
+
+**Performance needs:**
+
+- Alert latency under 2 minutes for critical issues
+- Dashboard load time under 3 seconds
+- Metrics collection overhead < 100MB RAM per host
+
+**Timeline constraints:**
+
+- Initial implementation: 2-3 weekends
+- Per-service SLO definition: 1-2 hours each
+- Ongoing tuning: ~1 hour/month
+
+### Stakeholders
+
+Primarily me, but also:
+
+- **Family members** who use Plex, Home Assistant, and the network
+- **Future me** who needs to debug issues months later
+- **Hiring managers** who would see this as signal of SRE thinking
+
+Their priorities:
+
+- **Family**: Services work when needed, minimal unexplained outages
+- **Future me**: Good data for troubleshooting, clear runbooks
+- **Professional signal**: Demonstrate production-ready reliability practices
+
+## The Decision
+
+### Options Considered
+
+#### Option 1: No Formal SRE Framework ("Wing It")
+
+**Description**: Continue running services, fix things when they break, maybe add some dashboards.
+
+**Pros:**
+
+- Zero upfront work
+- Maximum flexibility
+- No overhead
+- Works for low-stakes environments
+
+**Cons:**
+
+- No way to measure reliability improvements
+- Reactive instead of proactive
+- Can&apos;t prioritize engineering time rationally
+- No data to support infrastructure decisions
+- Alerts are arbitrary (too many or too few)
+
+**When this makes sense**: Truly experimental environments, learning labs, services with zero consequences for downtime.
+
+#### Option 2: Full Production SRE (Error Budgets, Post-Mortems, On-Call Rotation)
+
+**Description**: Implement complete SRE discipline—error budgets, blameless post-mortems, on-call rotation, etc.
+
+**Pros:**
+
+- Maximum reliability
+- Forces rigorous thinking
+- Great signal for SRE roles
+- Fully representative of production practices
+
+**Cons:**
+
+- Massive overkill for homelab scale
+- Unsustainable solo (on-call rotation of one?)
+- Analysis paralysis on SLO definition
+- Time investment exceeds value for most homelab services
+
+**When this makes sense**: Team environments, services with real users, learning SRE for role transition, production systems.
+
+#### Option 3: Adapted SRE Framework (SLIs/SLOs + Thoughtful Alerting)
+
+**Description**: Apply SRE principles but adapt them to homelab context—define SLIs/SLOs for critical services, build smart alerting, focus monitoring on what matters.
+
+**Pros:**
+
+- Brings clarity without overhead
+- Makes tradeoffs explicit
+- Alerts are actionable
+- Demonstrates production thinking
+- Sustainable long-term
+- Teaches transferable skills
+
+**Cons:**
+
+- Requires upfront design thinking
+- Need to learn SRE concepts
+- Some services don&apos;t need this rigor
+- Can over-invest in less critical services
+
+**When this makes sense**: Homelab services you rely on, infrastructure you want to operate professionally, skill-building for SRE roles.
+
+### The Choice
+
+I chose the **Adapted SRE Framework** for several reasons:
+
+**Deciding factors:**
+
+1. **Clarity over guesswork**: Defining SLIs forced me to articulate what "working" means for each service
+2. **Actionable alerts**: Separating page-worthy events from informational ones restored my sanity
+3. **Rational prioritization**: SLOs let me decide where reliability improvements would actually matter
+4. **Career signal**: This approach demonstrates production SRE thinking at homelab scale
+
+**How was the decision validated?**
+After implementing:
+
+- Identified that DNS had 99.2% uptime (thought it was higher)
+- Found reverse proxy latency spikes correlated with backup jobs
+- Reduced noise alerts from 15/week to 2/month
+- Actually got paged for a critical DNS failure (validation that it works)
+
+**What made this the right choice for this context?**
+Homelab sits between "toy project" and "production system." I rely on these services (DNS, reverse proxy, media) but they&apos;re not life-or-death. The framework needed to be rigorous enough to be useful but lightweight enough to maintain solo.
+
+### Implementation Approach
+
+**Migration strategy**: Incremental rollout per service tier
+
+**Rollout plan:**
+
+1. **Tier 0 (Critical)**: DNS, reverse proxy, auth
+   - Define SLIs/SLOs
+   - Implement basic monitoring
+   - Configure alerting rules
+2. **Tier 1 (Important)**: Plex, Home Assistant, NAS
+   - Add SLIs/SLOs
+   - Dashboard creation
+   - Informational alerts only
+3. **Tier 2 (Nice-to-have)**: Everything else
+   - Metrics collection only
+   - No alerting unless patterns emerge
+
+**Risk mitigation steps:**
+
+- Start with monitoring-only mode (no alerts) for 2 weeks to calibrate
+- Alert thresholds set at 2x observed baseline initially
+- Dead man&apos;s switch to alert if monitoring itself fails
+- All SLOs documented in runbooks with rationale
+
+**Success criteria:**
+
+- All Tier 0 services have defined SLIs/SLOs
+- Zero false-positive pages in first month
+- Real outage triggers page within 5 minutes
+- Can explain any service&apos;s current reliability from dashboards
+
+## Tradeoffs
+
+### What We Gained
+
+**Operational clarity:**
+
+- Know actual reliability (DNS: 99.7%, Reverse Proxy: 99.95%, NAS: 99.1%)
+- Quantified impact of maintenance windows
+- Data-driven decisions on HA investments
+- Clear picture of what&apos;s "broken vs degraded"
+
+**Better alerting:**
+
+- Page-worthy alerts: 2-3 per month (all actionable)
+- Informational alerts: visible in dashboard, no wake-ups
+- Alert fatigue eliminated
+- Mean time to detection: ~3 minutes for critical issues
+
+**Reliability improvements:**
+
+- Identified DNS server memory leak (uptime improved from 99.2% to 99.7%)
+- Found reverse proxy bottleneck during backups
+- Discovered NAS hitting IOPS limits during Plex transcoding
+- Prevented 3 outages through proactive monitoring
+
+**Professional development:**
+
+- Practiced SLO definition
+- Built production-grade dashboards
+- Learned Prometheus, Grafana, Alertmanager
+- Created portfolio piece demonstrating SRE thinking
+
+### What We Gave Up
+
+**Time investment:**
+
+- Initial setup: ~20 hours over 3 weekends
+- Per-service SLO definition: 1-2 hours each
+- Dashboard tuning: ~5 hours total
+- Ongoing maintenance: 1 hour/month
+
+**Increased complexity:**
+
+- Monitoring stack uses ~2GB RAM, 50GB storage
+- Another set of services to keep running (monitoring the monitors problem)
+- Learning curve for Prometheus query language (PromQL)
+- Need to document SLOs or they become stale
+
+**Operational overhead:**
+
+- Alert tuning required (initial false positives)
+- Metrics cardinality can explode if not careful
+- Dashboard proliferation (fought urge to create 20 dashboards)
+
+**Mental overhead:**
+
+- Need to think about SLOs when changing services
+- Temptation to over-optimize (99.9% → 99.99% for a homelab?)
+
+### The Balance
+
+For homelab infrastructure you actually rely on, this investment pays off:
+
+**Why the gains outweighed the costs:**
+
+- 20 hours upfront saved ~2 hours/month in debugging
+- Eliminated "is it down?" checking behavior
+- Sleep quality improved (no wondering if things are broken)
+- Skills directly transferred to work (promoted to SRE role)
+
+**Why the timing was right:**
+
+- Services had matured to point where reliability mattered
+- Prometheus/Grafana stack is now mature and well-documented
+- Pattern templates available (no need to invent from scratch)
+- Had experienced production on-call pain (knew what to avoid)
+
+**What&apos;s context-specific:**
+This works for homelabs where:
+
+- You rely on the services daily
+- Downtime is disruptive but not catastrophic
+- You&apos;re learning SRE practices
+- You have spare compute for monitoring stack
+
+**What might change this calculus:**
+
+- If services were truly critical → need HA, not just monitoring
+- If solo hobby project → monitoring might be overkill
+- If learning different skills → invest elsewhere
+- If family didn&apos;t use services → less reliability needed
+
+## Takeaways
+
+### For Similar Situations
+
+When applying SRE to homelab:
+
+**Key factors to consider:**
+
+1. **Start with service tiers** - not everything needs SLOs
+2. **Define SLIs before infrastructure** - know what to measure first
+3. **Alert on symptoms, not causes** - "DNS queries failing" not "process crashed"
+4. **Error budgets inform investment** - 99.9% SLO but achieving 99.99%? Stop optimizing.
+
+**Red flags to watch for:**
+
+- Alerts you ignore (fix threshold or remove alert)
+- SLOs you can&apos;t measure (pick different SLIs)
+- 100% SLO targets (not realistic, not sustainable)
+- Monitoring that costs more than the service
+
+**Questions to ask upfront:**
+
+- What does "working" mean for this service?
+- How would I know if it&apos;s broken?
+- What&apos;s acceptable downtime per month?
+- Would I wake up at 2am to fix this?
+
+**Common pitfalls to avoid:**
+
+- Alerting on everything (alert fatigue kills effectiveness)
+- Too many SLIs (focus on 2-3 per service max)
+- Unrealistic SLOs (99.99% is hard even for tech giants)
+- No documentation (SLOs without context are meaningless)
+
+### For Different Contexts
+
+**When this approach wouldn&apos;t work:**
+
+- Truly experimental environments (no reliability expectations)
+- Learning labs (constant churn, nothing stable)
+- Services with zero dependencies (single-user scripts)
+- Environments without spare resources for monitoring
+
+**What would need to be different:**
+
+- Production: Add error budgets, post-mortems, change management
+- Team labs: Add on-call rotation, shared runbooks
+- Learning: Simplify to just uptime checks and basic dashboards
+- Constrained resources: Use lightweight monitoring (Netdata, etc.)
+
+**Alternative strategies to consider:**
+
+- **External monitoring**: UptimeRobot, Pingdom (free tiers exist)
+- **Logs-only approach**: Loki + log-based alerting
+- **APM tools**: Grafana Cloud free tier
+- **Synthetic monitoring**: Blackbox exporter for end-to-end checks
+
+### Timeless Principles
+
+**SLI Definition:**
+
+1. Measure user-facing metrics (latency, availability, errors)
+2. Keep it simple (2-3 SLIs per service)
+3. Choose metrics you can act on
+4. Quantify, don&apos;t guess ("fast" → "p95 < 100ms")
+
+**SLO Philosophy:**
+
+- SLOs should hurt when violated (if you don&apos;t care, it&apos;s not an SLO)
+- They drive behavior (missing SLO → invest in reliability)
+- They enable tradeoffs (meeting SLO → invest in features)
+- They should be achievable (aspirational SLOs demotivate)
+
+**Alerting Strategy:**
+
+- **Page**: Immediate action required, user-facing impact
+- **Ticket**: Fix this week, not urgent
+- **Dashboard**: Informational, trend monitoring
+- **Never alert on**: Things you can&apos;t or won&apos;t fix
+
+**Monitoring Design:**
+
+- Collect metrics always, alert rarely
+- Retention matches debug needs (30 days minimum)
+- Dashboards answer specific questions
+- Simplicity beats comprehensiveness
+
+### Looking Back
+
+**What went as expected:**
+
+- SLO definition forced clarity (hardest part)
+- Alert tuning took longer than expected (2-3 iterations)
+- Family noticed fewer mysterious outages
+- Dashboards became addictive to check
+
+**What surprised me:**
+
+- How low some services&apos; actual reliability was
+- How many alerts were noise (80% false positive initially)
+- How satisfying hitting SLO targets feels
+- Monitoring itself is a reliability challenge
+
+**What I&apos;d do differently:**
+
+- Start with fewer SLIs (I over-complicated initially)
+- Define SLOs in writing first, implement second
+- Use alert templates from day one
+- Set up dead man&apos;s switch earlier
+
+**What reinforced my original thinking:**
+
+- SRE principles scale down beautifully
+- Clarity beats complexity
+- Good alerting is life-changing
+- Operational excellence is a practice, not a destination
+
+---
+
+**My Core Homelab SLOs:**
+
+| Service       | SLI                     | SLO     | Current |
+| ------------- | ----------------------- | ------- | ------- |
+| DNS           | Query success rate      | 99.5%   | 99.7%   |
+| DNS           | Query latency p95       | < 50ms  | 28ms    |
+| Reverse Proxy | HTTP success rate       | 99.9%   | 99.95%  |
+| Reverse Proxy | Response time p95       | < 200ms | 145ms   |
+| Plex          | Stream start success    | 99%     | 99.3%   |
+| NAS           | File access latency p95 | < 100ms | 87ms    |
+
+**Alerting Rules:**
+
+- **Page-worthy**: DNS down, Reverse Proxy error rate > 5%, Auth service unavailable
+- **Informational**: High latency (not down), backup failures, disk space warnings
+- **Dashboard-only**: Resource utilization, request rates, cache hit ratios
+
+_Last updated: 2024-01-22_

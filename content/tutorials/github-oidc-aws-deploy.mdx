@@ -1,0 +1,668 @@
+---
+title: "Tutorial: GitHub OIDC to AWS - Secure CI/CD Without Long-Lived Keys"
+date: "2024-01-24"
+summary: "Eliminate long-lived AWS credentials from CI/CD by using GitHub's OIDC provider to assume IAM roles, with minimal IAM policies for S3 sync and CloudFront invalidation."
+tags: ["AWS", "GitHub Actions", "OIDC", "Security", "CI/CD", "Tutorial"]
+featured: true
+---
+
+# Tutorial: GitHub OIDC to AWS - Secure CI/CD Without Long-Lived Keys
+
+## Goal
+
+### What You&apos;ll Build
+
+- GitHub OIDC identity provider in AWS IAM
+- IAM role with least-privilege policy for deployments
+- GitHub Actions workflow that deploys to S3 + CloudFront
+- Zero long-lived AWS access keys
+- Verified deployment with audit trail
+
+### What You&apos;ll Learn
+
+- OIDC (OpenID Connect) authentication flow
+- AWS IAM roles and trust policies
+- GitHub Actions OIDC token usage
+- Principle of least privilege in IAM
+- Secure CI/CD pipeline design
+- CloudFront cache invalidation
+
+### Time Required
+
+Estimated time to complete: **45-60 minutes**
+
+## Architecture
+
+### System Overview
+
+```
+┌──────────────────┐
+│  GitHub Actions  │
+│   Workflow Run   │
+└────────┬─────────┘
+         │
+         │ 1. Request OIDC token
+         ▼
+┌──────────────────┐
+│ GitHub OIDC      │
+│ Provider         │
+└────────┬─────────┘
+         │
+         │ 2. Return signed JWT token
+         ▼
+┌──────────────────┐      3. Assume role with token
+│   AWS STS        │◀────────────────────────────────┐
+│  (Temporary      │                                  │
+│   Credentials)   │                                  │
+└────────┬─────────┘                                  │
+         │                                            │
+         │ 4. Temp credentials                        │
+         ▼                                            │
+┌──────────────────┐                          ┌──────┴──────┐
+│  S3 Bucket       │                          │ GitHub      │
+│  + CloudFront    │◀─────5. Deploy──────────│ Actions     │
+└──────────────────┘                          │ Runner      │
+                                              └─────────────┘
+```
+
+**Security benefits:**
+
+- No AWS credentials in GitHub secrets
+- Temporary credentials (expire after 1 hour)
+- Scoped to specific repositories/branches
+- Audit trail in AWS CloudTrail
+- Centralized permission management
+
+### Technology Stack
+
+- **Identity Provider**: GitHub OIDC
+- **Cloud Provider**: AWS (IAM, STS, S3, CloudFront)
+- **CI/CD**: GitHub Actions
+- **IaC**: Terraform (optional, shown in code)
+
+### Design Decisions
+
+**Why OIDC over access keys?**
+
+- No secrets to rotate or leak
+- Automatic credential expiration
+- Repository-scoped access
+- Immutable audit trail
+
+**Why least-privilege IAM?**
+
+- Minimizes blast radius
+- Compliance requirement
+- Forces explicit permission grants
+- Prevents accidental damage
+
+**Why CloudFront invalidation?**
+
+- Instant cache updates
+- User sees latest content
+- Prevents stale cache issues
+
+## Prerequisites
+
+### Required Knowledge
+
+- AWS IAM basics (roles, policies)
+- GitHub Actions workflow syntax
+- Basic Terraform (optional)
+- S3 and CloudFront concepts
+
+### Required Tools
+
+- **AWS Account** with admin access
+- **GitHub repository** (public or private)
+- **AWS CLI** v2 installed and configured
+- **Terraform** 1.5+ (optional for IaC approach)
+- **Existing S3 + CloudFront** setup (or create during tutorial)
+
+### Setup Verification
+
+```bash
+# Check AWS CLI
+aws --version
+# Should show: aws-cli/2.x
+
+# Verify AWS credentials
+aws sts get-caller-identity
+# Should return your IAM user/role
+
+# Check you have permissions
+aws iam list-roles --max-items 1
+# Should not error
+
+# Verify GitHub CLI (optional)
+gh --version
+```
+
+**Assumptions:**
+
+- You have an S3 bucket for static site hosting
+- CloudFront distribution exists pointing to that bucket
+- You own the GitHub repository
+
+## Steps
+
+### Step 1: Create GitHub OIDC Provider in AWS
+
+**What this step accomplishes**: Register GitHub as a trusted identity provider in AWS IAM.
+
+Using **AWS Console**:
+
+1. Navigate to **IAM → Identity Providers**
+2. Click **Add provider**
+3. Select **OpenID Connect**
+4. Set values:
+   - **Provider URL**: `https://token.actions.githubusercontent.com`
+   - **Audience**: `sts.amazonaws.com`
+5. Click **Add provider**
+
+**Using AWS CLI:**
+
+```bash
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+```
+
+**Using Terraform:**
+
+```hcl
+resource "aws_iam_openid_connect_provider" "github_actions" {
+  url = "https://token.actions.githubusercontent.com"
+
+  client_id_list = [
+    "sts.amazonaws.com",
+  ]
+
+  thumbprint_list = [
+    "6938fd4d98bab03faadb97b34396831e3780aea1"
+  ]
+}
+```
+
+**Verification:**
+
+```bash
+aws iam list-open-id-connect-providers
+```
+
+Expected output:
+
+```json
+{
+  "OpenIDConnectProviderList": [
+    {
+      "Arn": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+    }
+  ]
+}
+```
+
+### Step 2: Create IAM Role with Trust Policy
+
+**What this step accomplishes**: Create role that GitHub Actions can assume, scoped to specific repo.
+
+**Define trust policy** (`github-oidc-trust-policy.json`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:YOUR_USERNAME/YOUR_REPO:*"
+        }
+      }
+    }
+  ]
+}
+```
+
+**Key parts:**
+
+- `Federated`: Points to GitHub OIDC provider
+- `aud`: Audience must be `sts.amazonaws.com`
+- `sub`: Restricts to specific repo (prevents other repos from assuming role)
+
+**Create role:**
+
+```bash
+# Replace with your account ID
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# Replace with your GitHub username/repo
+export GITHUB_REPO="yourusername/your-repo"
+
+# Update trust policy JSON with your values
+sed -i "s/123456789012/$AWS_ACCOUNT_ID/g" github-oidc-trust-policy.json
+sed -i "s|YOUR_USERNAME/YOUR_REPO|$GITHUB_REPO|g" github-oidc-trust-policy.json
+
+# Create IAM role
+aws iam create-role \
+  --role-name GitHubActionsDeployRole \
+  --assume-role-policy-document file://github-oidc-trust-policy.json
+```
+
+**Using Terraform:**
+
+```hcl
+data "aws_iam_policy_document" "github_actions_assume_role" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github_actions.arn]
+    }
+
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = ["repo:${var.github_repo}:*"]
+    }
+  }
+}
+
+resource "aws_iam_role" "github_actions_deploy" {
+  name               = "GitHubActionsDeployRole"
+  assume_role_policy = data.aws_iam_policy_document.github_actions_assume_role.json
+}
+```
+
+### Step 3: Attach Least-Privilege IAM Policy
+
+**What this step accomplishes**: Grant only S3 sync and CloudFront invalidation permissions.
+
+**Create permission policy** (`deploy-permissions.json`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3BucketSync",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:PutObjectAcl",
+        "s3:GetObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-bucket-name",
+        "arn:aws:s3:::your-bucket-name/*"
+      ]
+    },
+    {
+      "Sid": "CloudFrontInvalidation",
+      "Effect": "Allow",
+      "Action": ["cloudfront:CreateInvalidation", "cloudfront:GetInvalidation"],
+      "Resource": "arn:aws:cloudfront::123456789012:distribution/YOUR_DISTRIBUTION_ID"
+    }
+  ]
+}
+```
+
+**Attach policy to role:**
+
+```bash
+# Update with your S3 bucket and CloudFront distribution
+export S3_BUCKET="your-bucket-name"
+export CF_DISTRIBUTION_ID="E1234567890ABC"
+
+# Update policy JSON
+sed -i "s/your-bucket-name/$S3_BUCKET/g" deploy-permissions.json
+sed -i "s/123456789012/$AWS_ACCOUNT_ID/g" deploy-permissions.json
+sed -i "s/YOUR_DISTRIBUTION_ID/$CF_DISTRIBUTION_ID/g" deploy-permissions.json
+
+# Create inline policy
+aws iam put-role-policy \
+  --role-name GitHubActionsDeployRole \
+  --policy-name S3CloudFrontDeployPolicy \
+  --policy-document file://deploy-permissions.json
+```
+
+**Verification:**
+
+```bash
+aws iam get-role --role-name GitHubActionsDeployRole
+aws iam get-role-policy \
+  --role-name GitHubActionsDeployRole \
+  --policy-name S3CloudFrontDeployPolicy
+```
+
+### Step 4: Create GitHub Actions Workflow
+
+**What this step accomplishes**: Configure GitHub Actions to use OIDC and deploy to AWS.
+
+Create `.github/workflows/deploy.yml`:
+
+```yaml
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write # Required for OIDC
+  contents: read # Required to checkout code
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsDeployRole
+          role-session-name: GitHubActionsDeploySession
+          aws-region: us-east-1
+
+      - name: Build site (example for static site)
+        run: |
+          # Replace with your build command
+          npm install
+          npm run build
+
+      - name: Sync to S3
+        run: |
+          aws s3 sync ./dist s3://${{ secrets.S3_BUCKET }} \
+            --delete \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CF_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+      - name: Deployment summary
+        run: |
+          echo "✅ Deployment completed"
+          echo "Bucket: ${{ secrets.S3_BUCKET }}"
+          echo "Distribution: ${{ secrets.CF_DISTRIBUTION_ID }}"
+```
+
+**Add GitHub Secrets** (Settings → Secrets and variables → Actions):
+
+- `AWS_ACCOUNT_ID`: Your AWS account ID
+- `S3_BUCKET`: S3 bucket name
+- `CF_DISTRIBUTION_ID`: CloudFront distribution ID
+
+**Note**: No AWS access keys needed!
+
+### Step 5: Test the Deployment
+
+**Trigger workflow**:
+
+```bash
+# Make a change and push
+echo "Test deployment" >> README.md
+git add README.md
+git commit -m "Test OIDC deployment"
+git push origin main
+```
+
+**Monitor in GitHub**:
+
+1. Go to **Actions** tab in GitHub
+2. Click on the running workflow
+3. Verify all steps succeed
+
+**Expected output** in "Configure AWS credentials" step:
+
+```
+Requesting token from GitHub OIDC provider
+Assuming role: arn:aws:iam::123456789012:role/GitHubActionsDeployRole
+Successfully assumed role
+Temporary credentials acquired (expires in 1 hour)
+```
+
+### Step 6: Verify Deployment
+
+**Check S3 upload:**
+
+```bash
+aws s3 ls s3://your-bucket-name/ --recursive
+```
+
+**Check CloudFront invalidation:**
+
+```bash
+aws cloudfront list-invalidations \
+  --distribution-id YOUR_DISTRIBUTION_ID
+```
+
+**Verify site is live:**
+
+```bash
+curl -I https://your-cloudfront-domain.com
+# Should show updated content
+```
+
+**Check AWS CloudTrail** for audit log:
+
+```bash
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=Username,AttributeValue=GitHubActionsDeployRole \
+  --max-results 10
+```
+
+## Verification
+
+### Testing the Complete System
+
+**Test 1: Successful deployment**
+
+- Push to main branch
+- Workflow completes successfully
+- Files appear in S3
+- CloudFront serves updated content
+
+**Test 2: Wrong repository attempts to assume role**
+
+- Try using the role ARN in a different repo
+- Should fail with "Not authorized"
+
+**Test 3: Branch restriction**
+
+- Modify trust policy to restrict to `ref:refs/heads/main`
+- Push to feature branch
+- Should fail to assume role
+
+### Expected Behavior
+
+- **Workflow runs**: Complete in 2-5 minutes
+- **Credentials**: Temporary, expire after 1 hour
+- **Deployment**: Files uploaded to S3, cache invalidated
+- **Audit trail**: CloudTrail logs show AssumeRoleWithWebIdentity
+
+### Verification Checklist
+
+- [x] GitHub OIDC provider created in AWS
+- [x] IAM role created with trust policy
+- [x] Permissions policy attached
+- [x] GitHub Actions workflow configured
+- [x] Deployment succeeds
+- [x] No AWS keys in GitHub secrets
+- [x] CloudTrail shows OIDC assumption
+- [x] Site updated successfully
+
+## Failure Test/Recovery
+
+### Scenario 1: Invalid OIDC Token
+
+**Simulate**: Modify `aud` condition in trust policy to wrong value
+
+**Expected**: Workflow fails with "Not authorized to perform sts:AssumeRoleWithWebIdentity"
+
+**Recovery**: Fix trust policy condition
+
+### Scenario 2: Insufficient IAM Permissions
+
+**Simulate**: Remove `s3:PutObject` from policy
+
+**Expected**: Workflow fails during S3 sync step
+
+**Recovery**: Add missing permission to policy
+
+### Scenario 3: CloudFront Invalidation Limit
+
+**Issue**: Max 3000 invalidations per month (free tier)
+
+**Handling**: Batch invalidations, use versioned URLs, cache bust patterns
+
+## Monitoring Notes
+
+### What to Monitor
+
+- **Deployment success rate**: Percentage of successful deployments
+- **AssumeRole calls**: Track in CloudTrail
+- **S3 sync duration**: Should be consistent
+- **CloudFront invalidation status**: Check for failures
+- **IAM policy violations**: Denied actions in CloudTrail
+
+### Alerting Recommendations
+
+**Page-worthy**:
+
+- Deployment failures > 2 consecutive
+- Unauthorized AssumeRole attempts
+- S3 access denied errors
+
+**Informational**:
+
+- Deployment completion
+- CloudFront invalidation finished
+- Approaching invalidation limit
+
+## Tradeoffs
+
+### Security Improvements
+
+**What we gained**:
+
+- No long-lived credentials (eliminates key rotation)
+- Audit trail of every deployment
+- Repository-scoped access (can&apos;t be used elsewhere)
+- Automatic expiration (1-hour credentials)
+- Centralized permission management
+
+**Versus long-lived access keys**:
+
+- Keys can be leaked, stolen, or compromised
+- Require rotation procedures
+- Often over-permissioned
+- Difficult to audit usage
+- No automatic expiration
+
+### Operational Tradeoffs
+
+**Initial setup complexity**: Higher (OIDC provider, trust policies)
+**Ongoing maintenance**: Lower (no key rotation, less to manage)
+**Debugging**: Slightly harder (trust policy conditions can be finicky)
+**Flexibility**: Higher (easy to add repos, adjust permissions)
+
+### When to Use This Pattern
+
+**Ideal for**:
+
+- Any GitHub Actions deployment to AWS
+- Multi-repo organizations (each repo gets scoped role)
+- Compliance-sensitive environments
+- Public repositories (no secrets exposure risk)
+
+**Not needed if**:
+
+- Deploying from non-GitHub CI (use equivalent OIDC provider)
+- Local deployments (AWS CLI with user credentials)
+- Truly ephemeral environments (though OIDC still preferred)
+
+## Next Steps
+
+### Enhancements
+
+1. **Multi-environment deployments**
+
+   ```yaml
+   # Different roles for staging/production
+   role-to-assume: |
+     ${{ github.ref == 'refs/heads/main' &&
+         'arn:aws:iam::123:role/ProductionDeployRole' ||
+         'arn:aws:iam::123:role/StagingDeployRole' }}
+   ```
+
+2. **Session tagging**
+
+   ```yaml
+   - uses: aws-actions/configure-aws-credentials@v4
+     with:
+       role-to-assume: ${{ secrets.ROLE_ARN }}
+       role-session-name: Deploy-${{ github.run_id }}
+       aws-region: us-east-1
+       # Add session tags for detailed audit
+       role-session-tags: |
+         actor=${{ github.actor }}
+         repo=${{ github.repository }}
+         branch=${{ github.ref_name }}
+   ```
+
+3. **Conditional deployments**
+   ```yaml
+   - name: Deploy to production
+     if: github.ref == 'refs/heads/main'
+     run: |
+       aws s3 sync ./dist s3://production-bucket
+   ```
+
+### Production Hardening
+
+- Restrict trust policy to specific branches
+- Add IP restrictions (if GitHub provides IPs)
+- Implement approval gates for production
+- Add deployment notifications (Slack, email)
+- Set up rollback procedures
+- Monitor AWS costs with budget alerts
+
+---
+
+**Security Wins:**
+
+- ✅ Zero long-lived credentials
+- ✅ Automatic credential expiration
+- ✅ Least-privilege IAM policies
+- ✅ Repository-scoped access
+- ✅ Full audit trail in CloudTrail
+- ✅ No secrets management overhead
+
+**This pattern eliminates an entire class of security risks while simplifying CI/CD operations.**
+
+_Last updated: 2024-01-24_

@@ -1,0 +1,514 @@
+---
+title: "Homelab Observability Stack"
+date: "2024-01-28"
+summary: "A production-grade monitoring and alerting platform using Prometheus, Grafana, and Alertmanager to provide full visibility into homelab infrastructure with SRE-focused metrics and incident response."
+tags: ["Prometheus", "Grafana", "Monitoring", "SRE", "Observability"]
+featured: true
+---
+
+# Homelab Observability Stack
+
+## Problem
+
+Operating homelab infrastructure without proper observability is like flying blind—you only discover problems when services are completely broken, troubleshooting is guesswork, and there's no historical data to identify patterns or capacity needs.
+
+I was relying on ad-hoc checks (`ssh` to boxes, manually running commands) to verify service health. This approach didn't scale, provided no alerting, and gave me no visibility into trends or early warning signs of degradation.
+
+**Specific challenges:**
+
+- **No proactive alerting**: Discovered outages hours later (or when family complained)
+- **No historical metrics**: Couldn't answer "when did this start?" or "has this happened before?"
+- **Manual troubleshooting**: Had to SSH to each server to check logs, resource usage
+- **No SLO tracking**: No idea if services met reliability targets
+- **Alert fatigue from simple tools**: Uptime monitors (Pingdom) create noise, not insight
+
+**Why this matters:**
+If you can't measure it, you can't improve it. Without observability, you're reacting to symptoms instead of understanding root causes. This project taught me to operate infrastructure like an SRE: define SLIs, measure them, alert on violations, and use data to drive improvements.
+
+## Solution
+
+### Architecture Overview
+
+I built a comprehensive observability platform using:
+
+**Core monitoring stack:**
+
+- **Prometheus** for metrics collection and storage
+- **Grafana** for visualization and dashboards
+- **Alertmanager** for alert routing and deduplication
+- **Loki** for log aggregation (optional, metrics-focused initially)
+
+**Exporters and agents:**
+
+- **node_exporter**: System metrics (CPU, RAM, disk, network)
+- **blackbox_exporter**: Endpoint monitoring (HTTP, DNS, ICMP)
+- **redis_exporter**: Redis-specific metrics
+- **postgres_exporter**: PostgreSQL metrics
+- **nginx_exporter**: Web server metrics
+- **custom exporters**: Application-specific metrics
+
+**Alerting and notification:**
+
+- **Alertmanager**: Alert routing, silencing, inhibition rules
+- **Slack integration**: Notifications to #homelab-alerts channel
+- **Email notifications**: For critical alerts (PagerDuty-style)
+- **Dead man's switch**: External monitoring to alert if Prometheus is down
+
+### Key Technical Decisions
+
+**Why Prometheus over Nagios/Zabbix?**
+
+- **Pull-based model**: Simpler network topology (no agents pushing)
+- **Powerful query language**: PromQL enables complex metrics analysis
+- **Cloud-native design**: Scales well, widely adopted in industry
+- **Excellent ecosystem**: Hundreds of exporters available
+
+**Why Grafana over built-in Prometheus UI?**
+
+- **Better visualization**: Dashboards vs raw graphs
+- **Multi-datasource support**: Can add Loki, InfluxDB later
+- **Alerting integration**: Unified view of alerts and metrics
+- **Templating**: Reusable dashboards across services
+
+**Why Alertmanager over simple alerts?**
+
+- **Alert routing**: Different severity levels to different channels
+- **Deduplication**: Prevents alert storms
+- **Silencing**: Temporary mute during maintenance
+- **Grouping**: Related alerts bundled (not 50 separate notifications)
+
+## Architecture
+
+### Infrastructure Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Monitored Services                        │
+│  • DNS (PowerDNS)           • Redis Cluster                  │
+│  • Reverse Proxy (Nginx)    • PostgreSQL                     │
+│  • NAS (TrueNAS)            • Docker containers              │
+│  • Plex Media Server        • Home Assistant                 │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+                 │ Expose :9100 (node_exporter)
+                 │ Expose :9115 (blackbox_exporter)
+                 │ Expose service-specific exporters
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────────────┐
+│                       Prometheus                             │
+│  • Scrapes metrics every 15 seconds                          │
+│  • Retention: 90 days                                        │
+│  • Storage: ~20GB (compressed)                               │
+│  • PromQL query engine                                       │
+│  • Recording rules (pre-computed aggregations)               │
+│  • Alert rules (threshold definitions)                       │
+└────────────────┬────────────────────────────────────────────┘
+                 │
+         ┌───────┴───────┐
+         │               │
+         ▼               ▼
+┌──────────────┐  ┌──────────────────────────────────────────┐
+│ Alertmanager │  │            Grafana                        │
+│  • Routes    │  │  • Dashboards (15+)                       │
+│  • Groups    │  │  • Variables (host, service)              │
+│  • Silences  │  │  • Annotations (deployments, incidents)   │
+│  • Inhibits  │  │  • Users/teams (LDAP auth)                │
+└──────┬───────┘  └──────────────────────────────────────────┘
+       │
+       │ Send alerts
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  Notification Channels                       │
+│  • Slack (#homelab-alerts)                                   │
+│  • Email (critical only)                                     │
+│  • PagerDuty (future)                                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Prometheus Configuration
+
+Key sections of `prometheus.yml`:
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: "homelab"
+    environment: "production"
+
+# Alert rule files
+rule_files:
+  - "alerts/node_alerts.yml"
+  - "alerts/service_alerts.yml"
+  - "alerts/recording_rules.yml"
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["localhost:9093"]
+
+# Scrape configurations
+scrape_configs:
+  # Node exporter (system metrics)
+  - job_name: "node"
+    static_configs:
+      - targets:
+          - "nas.homelab:9100"
+          - "dns1.homelab:9100"
+          - "dns2.homelab:9100"
+          - "proxy.homelab:9100"
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "([^:]+):\\d+"
+        target_label: instance
+
+  # Blackbox exporter (endpoint monitoring)
+  - job_name: "blackbox"
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - https://blog.example.com
+          - https://git.homelab.local
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox.homelab:9115
+
+  # Service-specific exporters
+  - job_name: "redis"
+    static_configs:
+      - targets: ["redis1.homelab:9121", "redis2.homelab:9121"]
+
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["db1.homelab:9187", "db2.homelab:9187"]
+```
+
+### Alert Rules Example
+
+`alerts/node_alerts.yml`:
+
+```yaml
+groups:
+  - name: node_alerts
+    interval: 30s
+    rules:
+      # Critical: High CPU usage
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value }}% (threshold: 80%)"
+
+      # Critical: Low disk space
+      - alert: LowDiskSpace
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 < 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}"
+          description: "Disk {{ $labels.mountpoint }} has {{ $value }}% free"
+
+      # Critical: Service down
+      - alert: ServiceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} on {{ $labels.instance }} is down"
+          description: "Prometheus cannot scrape metrics from this target"
+
+      # Warning: High memory usage
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value }}% (threshold: 85%)"
+```
+
+### Alertmanager Configuration
+
+`alertmanager.yml`:
+
+```yaml
+global:
+  resolve_timeout: 5m
+  slack_api_url: "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+
+# Alert routing tree
+route:
+  receiver: "default"
+  group_by: ["alertname", "cluster", "instance"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Critical alerts go to Slack + Email
+    - match:
+        severity: critical
+      receiver: "critical-alerts"
+      group_wait: 10s
+      repeat_interval: 1h
+
+    # Warning alerts go to Slack only
+    - match:
+        severity: warning
+      receiver: "warning-alerts"
+      repeat_interval: 12h
+
+receivers:
+  - name: "default"
+    slack_configs:
+      - channel: "#homelab-alerts"
+        title: "{{ .GroupLabels.alertname }}"
+        text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+
+  - name: "critical-alerts"
+    slack_configs:
+      - channel: "#homelab-critical"
+        title: ":rotating_light: CRITICAL: {{ .GroupLabels.alertname }}"
+        text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+    email_configs:
+      - to: "alerts@example.com"
+        from: "prometheus@homelab.local"
+        smarthost: "smtp.gmail.com:587"
+        auth_username: "alerts@example.com"
+        auth_password: "<app-password>"
+
+  - name: "warning-alerts"
+    slack_configs:
+      - channel: "#homelab-alerts"
+        title: ":warning: Warning: {{ .GroupLabels.alertname }}"
+        text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+
+inhibit_rules:
+  # Don't alert on service down if the node is down
+  - source_match:
+      alertname: "NodeDown"
+    target_match:
+      alertname: "ServiceDown"
+    equal: ["instance"]
+```
+
+## Reliability & Security
+
+### Security Measures
+
+**Access control:**
+
+- **Grafana**: LDAP authentication, read-only viewers, admin editors
+- **Prometheus**: Accessible only via Grafana (reverse proxy)
+- **Alertmanager**: No external access (internal notifications only)
+- **TLS/HTTPS**: All web UIs behind reverse proxy with Let&apos;s Encrypt
+
+**Data security:**
+
+- **No sensitive data in labels**: PII, passwords excluded
+- **Metric retention**: 90 days (GDPR-compliant)
+- **Backup**: Prometheus data backed up weekly (cold storage)
+
+**Operational security:**
+
+- **Scrape targets restricted**: Only internal IPs allowed
+- **Firewall rules**: Exporter ports not exposed externally
+- **Secret management**: Alertmanager credentials in Vault
+
+### Reliability Design
+
+**Prometheus availability:**
+
+- **Single instance** (acceptable for homelab)
+- **Persistent storage**: Local SSD, ~20GB used
+- **Backup strategy**: Daily snapshots to NAS
+- **Recovery time**: ~10 minutes to restore from backup
+
+**Alertmanager reliability:**
+
+- **HA mode**: 2 Alertmanager instances (future improvement)
+- **Dead man&apos;s switch**: External monitor pings if no alerts in 10 minutes
+- **Notification retries**: Alertmanager retries failed Slack posts 3x
+
+**Grafana reliability:**
+
+- **Database**: SQLite (local), backed up daily
+- **Dashboards versioned**: JSON exported to Git weekly
+- **Provisioning**: Datasources and dashboards in code (not ClickOps)
+
+## Metrics
+
+### Performance Metrics
+
+**Prometheus performance:**
+
+- **Ingestion rate**: ~8,500 samples/second
+- **Active time series**: ~42,000
+- **Storage size**: 18.2 GB (90 days retention)
+- **Query latency (p95)**: 85ms
+- **Scrape duration (p95)**: 120ms
+
+**Grafana dashboard performance:**
+
+- **Load time (complex dashboard)**: 1.8 seconds
+- **Query rate**: ~200 queries/minute (when viewing dashboards)
+- **Concurrent users**: 1-3 (homelab scale)
+
+### Alert Metrics (Last 30 Days)
+
+**Alert volume:**
+
+- **Total alerts fired**: 47
+- **Critical alerts**: 8
+- **Warning alerts**: 39
+- **False positives**: 3 (6.4%)
+
+**Alert breakdown by type:**
+
+- High CPU usage: 12 alerts (mostly during backups)
+- Low disk space: 5 alerts (NAS filled up)
+- Service down: 8 alerts (planned maintenance + 1 real outage)
+- High memory usage: 18 alerts (PostgreSQL vacuum process)
+- Network issues: 4 alerts (ISP downtime)
+
+**Response metrics:**
+
+- **Mean time to detect (MTTD)**: 2.3 minutes
+- **Mean time to acknowledge**: 8 minutes (during waking hours)
+- **Mean time to resolve (MTTR)**: 35 minutes
+
+### Incident Example: Redis Out of Memory
+
+**Timeline:**
+
+- **16:42**: Alert fired - `RedisMemoryHigh` (memory usage 92%)
+- **16:44**: Acknowledged alert, SSH to redis1.homelab
+- **16:47**: Identified cause - memory leak in application (keys not expiring)
+- **16:52**: Applied fix - updated TTL policy via `redis-cli CONFIG SET`
+- **17:05**: Memory dropped to 68%, alert resolved
+- **17:30**: Postmortem written, added monitoring for key count growth
+
+**Root cause:**
+Application was setting keys without TTL, causing unbounded growth.
+
+**Fixes applied:**
+
+1. Updated app code to set 24h TTL on all cache keys
+2. Added Prometheus alert for key count exceeding 1M
+3. Documented Redis memory limits in runbook
+
+**Lessons learned:**
+
+- Default Redis `maxmemory-policy` should be `allkeys-lru` (not `noeviction`)
+- Monitor key count growth rate, not just memory
+- Test cache eviction under load
+
+## What I Learned
+
+### Technical Lessons
+
+**PromQL is powerful but tricky:**
+
+- **Rate vs irate**: `rate()` for alerts, `irate()` for graphs
+- **Aggregation matters**: `avg`, `sum`, `max` change interpretation
+- **Label cardinality kills performance**: Avoid high-cardinality labels (user IDs, timestamps)
+
+**Alert design is an art:**
+
+- **Too sensitive = alert fatigue**: Tune thresholds based on actual baseline
+- **Too coarse = missed incidents**: Need multi-tier alerting (warning → critical)
+- **Duration matters**: `for: 5m` prevents transient spike alerts
+
+**Grafana dashboard design:**
+
+- **Less is more**: 6 panels per dashboard (not 30)
+- **Use variables**: Dashboards should work for any host/service
+- **Annotations are gold**: Mark deploys, incidents, changes
+
+**Exporter gotchas:**
+
+- **node_exporter** excludes some filesystems by default (check `--collector.filesystem.ignored-mount-points`)
+- **blackbox_exporter** requires correct DNS resolution (use IP if DNS is what you&apos;re monitoring)
+- Custom exporters need proper error handling (crashes aren&apos;t scraped)
+
+### Process Improvements
+
+**What worked well:**
+
+1. **Started with SLIs/SLOs** - defined what to measure before building dashboards
+2. **Incremental rollout** - added exporters one service at a time
+3. **Runbooks linked in alerts** - annotations include troubleshooting steps
+4. **Weekly dashboard review** - iterate on what&apos;s useful vs noise
+
+**What I'd do differently:**
+
+1. **Define alert SLOs earlier** - how many false positives are acceptable?
+2. **Use recording rules sooner** - complex queries as alerts are slow
+3. **Version dashboards in Git from day one** - lost 2 weeks of dashboard work to accidental delete
+4. **Set up Loki earlier** - logs + metrics together are powerful
+
+### Operational Insights
+
+**Alert tuning evolution:**
+
+- **Initial**: 80% false positive rate (too sensitive)
+- **After 1 month**: 30% false positive rate (better thresholds)
+- **After 3 months**: 6% false positive rate (context-aware alerts)
+
+**Most valuable dashboards:**
+
+1. **Service health overview** - single pane for all critical services
+2. **Node resource usage** - CPU/RAM/disk trends
+3. **Redis cluster health** - replication lag, memory, hit rate
+4. **DNS performance** - query latency, NXDOMAIN rate
+
+**Most valuable alerts:**
+
+1. **ServiceDown** - critical services unreachable
+2. **LowDiskSpace** - prevented NAS failures twice
+3. **HighReplicationLag** - caught PostgreSQL streaming replication issues
+4. **SSLCertExpiringSoon** - automated renewal failures
+
+**Skills gained:**
+
+- Writing effective PromQL queries
+- Alert design and tuning (reducing false positives)
+- Incident response workflow (alert → triage → fix → postmortem)
+- Grafana provisioning and automation
+
+## Links
+
+- **GitHub repository**: [github.com/username/homelab-monitoring](https://github.com/username/homelab-monitoring)
+- **Grafana dashboards**: [grafana.homelab.local](https://grafana.homelab.local) (internal only)
+- **Prometheus**: [prometheus.homelab.local](https://prometheus.homelab.local) (internal only)
+
+**Public dashboard exports:**
+
+- [Node exporter dashboard (JSON)](https://github.com/username/homelab-monitoring/blob/main/grafana/node-exporter.json)
+- [Redis dashboard (JSON)](https://github.com/username/homelab-monitoring/blob/main/grafana/redis-cluster.json)
+
+**Related documentation:**
+
+- [Prometheus Documentation](https://prometheus.io/docs/)
+- [Grafana Provisioning](https://grafana.com/docs/grafana/latest/administration/provisioning/)
+- [Awesome Prometheus Alerts](https://awesome-prometheus-alerts.grep.to/)
+- [SRE Book - Monitoring Distributed Systems](https://sre.google/sre-book/monitoring-distributed-systems/)
+
+---
+
+_Last updated: 2024-01-28_

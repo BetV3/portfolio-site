@@ -1,0 +1,962 @@
+---
+title: "Tutorial: Building a PostgreSQL HA Cluster with Failover Testing"
+date: "2024-01-28"
+summary: "Build a production-grade PostgreSQL high-availability cluster from scratch, prove replication works, simulate failovers, and verify backup/restore procedures."
+tags: ["PostgreSQL", "High Availability", "Tutorial", "Database", "Replication"]
+featured: true
+---
+
+# Tutorial: Building a PostgreSQL HA Cluster with Failover Testing
+
+## Goal
+
+### What You&apos;ll Build
+
+By the end of this tutorial, you&apos;ll have:
+
+- A 3-node PostgreSQL cluster (1 primary, 2 replicas)
+- Streaming replication with automatic failover
+- Verified backup and restore procedures
+- Monitoring dashboards showing replication lag
+- Documented runbook for failure scenarios
+
+### What You&apos;ll Learn
+
+Key concepts and skills:
+
+- PostgreSQL streaming replication fundamentals
+- Patroni for automatic failover orchestration
+- etcd for distributed consensus
+- WAL (Write-Ahead Log) management
+- Point-in-time recovery (PITR)
+- Failover testing and validation
+- Production-grade PostgreSQL operations
+
+### Time Required
+
+Estimated time to complete: **3-4 hours**
+
+## Architecture
+
+### System Overview
+
+Our HA cluster consists of:
+
+```
+┌─────────────┐      ┌─────────────┐      ┌─────────────┐
+│  pg-node-1  │      │  pg-node-2  │      │  pg-node-3  │
+│  (Primary)  │─────▶│  (Replica)  │      │  (Replica)  │
+│             │      │             │      │             │
+│  Patroni    │      │  Patroni    │      │  Patroni    │
+└─────────────┘      └─────────────┘      └─────────────┘
+       │                    │                    │
+       └────────────────────┴────────────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │etcd cluster │
+                    │(Consensus)  │
+                    └─────────────┘
+```
+
+**Data flow:**
+
+1. Client writes to primary (pg-node-1)
+2. WAL shipped to replicas in real-time
+3. Replicas apply changes asynchronously
+4. Patroni monitors health via etcd
+5. Automatic failover if primary fails
+
+### Technology Stack
+
+- **Database**: PostgreSQL 15
+- **HA Manager**: Patroni 3.x
+- **Consensus**: etcd 3.5
+- **OS**: Ubuntu 22.04 LTS
+- **Backup**: pgBackRest
+- **Monitoring**: Prometheus + postgres_exporter
+- **Infrastructure**: 3 VMs (local or cloud)
+
+### Design Decisions
+
+**Why Patroni?**
+
+- Industry-standard HA solution
+- Automatic failover (no manual intervention)
+- Integrates with etcd/Consul/ZooKeeper
+- Active community, good documentation
+
+**Why etcd for consensus?**
+
+- Lightweight, proven distributed consensus
+- Used by Kubernetes (familiar to many)
+- Simple HTTP API
+- Handles split-brain scenarios
+
+**Why streaming replication?**
+
+- Near real-time replication (low lag)
+- Built into PostgreSQL (no extensions)
+- Efficient (only changed data)
+- Industry standard pattern
+
+## Prerequisites
+
+### Required Knowledge
+
+Before starting, you should understand:
+
+- Linux command line (intermediate level)
+- Basic SQL and database concepts
+- systemd service management
+- YAML configuration files
+- Basic networking (ports, firewalls)
+
+### Required Tools
+
+You&apos;ll need:
+
+- **3 Linux VMs** (4GB RAM, 2 vCPUs each minimum)
+  - Local: VirtualBox, QEMU/KVM, Proxmox
+  - Cloud: AWS EC2 t3.medium, DigitalOcean Droplets
+- **SSH access** to all nodes
+- **sudo/root privileges**
+- **PostgreSQL 15** (installed via apt)
+- **Text editor** (vim, nano, etc.)
+
+### Setup Verification
+
+Verify prerequisites on each node:
+
+```bash
+# Check Ubuntu version
+lsb_release -a
+# Should show: Ubuntu 22.04
+
+# Check available memory
+free -h
+# Should show: at least 3.5GB available
+
+# Verify network connectivity
+ping -c 3 8.8.8.8
+
+# Check if ports are available
+sudo ss -tuln | grep -E ":(5432|2379|2380|8008)"
+# Should return empty (ports not in use)
+```
+
+**IP addresses** (replace with your actual IPs):
+
+- pg-node-1: `192.168.1.10`
+- pg-node-2: `192.168.1.11`
+- pg-node-3: `192.168.1.12`
+
+## Steps
+
+### Step 1: Install PostgreSQL on All Nodes
+
+**What this step accomplishes**: Install PostgreSQL 15 and required dependencies on all three nodes.
+
+On **each node**, run:
+
+```bash
+# Add PostgreSQL apt repository
+sudo apt install -y postgresql-common
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+
+# Install PostgreSQL 15 and contrib packages
+sudo apt update
+sudo apt install -y postgresql-15 postgresql-15-contrib
+
+# Stop PostgreSQL (Patroni will manage it)
+sudo systemctl stop postgresql
+sudo systemctl disable postgresql
+```
+
+**Expected Output:**
+
+```
+Setting up postgresql-15 (15.5-1.pgdg22.04+1) ...
+Creating new PostgreSQL cluster 15/main ...
+Stopping postgresql@15-main.service
+Disabling postgresql@15-main.service
+```
+
+**Verification:**
+
+```bash
+psql --version
+# Should show: psql (PostgreSQL) 15.5
+```
+
+### Step 2: Install etcd Cluster
+
+**What this step accomplishes**: Set up a 3-node etcd cluster for distributed consensus.
+
+On **all nodes**, install etcd:
+
+```bash
+sudo apt install -y etcd
+
+# Stop default service
+sudo systemctl stop etcd
+sudo systemctl disable etcd
+```
+
+Create etcd configuration on **pg-node-1** (`/etc/etcd/etcd.conf.yml`):
+
+```yaml
+name: pg-node-1
+data-dir: /var/lib/etcd
+initial-cluster-state: new
+initial-cluster-token: postgres-ha-cluster
+initial-cluster: pg-node-1=http://192.168.1.10:2380,pg-node-2=http://192.168.1.11:2380,pg-node-3=http://192.168.1.12:2380
+initial-advertise-peer-urls: http://192.168.1.10:2380
+advertise-client-urls: http://192.168.1.10:2379
+listen-peer-urls: http://192.168.1.10:2380
+listen-client-urls: http://192.168.1.10:2379,http://127.0.0.1:2379
+```
+
+Repeat for **pg-node-2** and **pg-node-3**, changing IPs and names accordingly.
+
+Start etcd on all nodes:
+
+```bash
+sudo systemctl enable etcd
+sudo systemctl start etcd
+sudo systemctl status etcd
+```
+
+**Verification:**
+
+```bash
+etcdctl member list
+```
+
+Expected output showing 3 members:
+
+```
+8e9e05c52164694d: name=pg-node-1 peerURLs=http://192.168.1.10:2380 clientURLs=http://192.168.1.10:2379
+91bc3c398fb3c146: name=pg-node-2 peerURLs=http://192.168.1.11:2380 clientURLs=http://192.168.1.11:2379
+fd422379fda50e48: name=pg-node-3 peerURLs=http://192.168.1.12:2380 clientURLs=http://192.168.1.12:2379
+```
+
+### Step 3: Install and Configure Patroni
+
+**What this step accomplishes**: Install Patroni and configure it to manage PostgreSQL replication.
+
+On **all nodes**:
+
+```bash
+# Install Patroni and Python dependencies
+sudo apt install -y python3-pip python3-dev libpq-dev
+sudo pip3 install patroni[etcd] psycopg2-binary
+
+# Create Patroni directory
+sudo mkdir -p /etc/patroni
+sudo mkdir -p /var/lib/patroni
+sudo chown postgres:postgres /var/lib/patroni
+```
+
+Create Patroni config on **pg-node-1** (`/etc/patroni/config.yml`):
+
+```yaml
+scope: postgres-cluster
+namespace: /db/
+name: pg-node-1
+
+restapi:
+  listen: 192.168.1.10:8008
+  connect_address: 192.168.1.10:8008
+
+etcd:
+  hosts: 192.168.1.10:2379,192.168.1.11:2379,192.168.1.12:2379
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        max_connections: 100
+        shared_buffers: 128MB
+        wal_level: replica
+        hot_standby: on
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: 1GB
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+  pg_hba:
+    - host replication replicator 127.0.0.1/32 md5
+    - host replication replicator 192.168.1.0/24 md5
+    - host all all 0.0.0.0/0 md5
+
+postgresql:
+  listen: 192.168.1.10:5432
+  connect_address: 192.168.1.10:5432
+  data_dir: /var/lib/postgresql/15/main
+  pgpass: /tmp/pgpass
+  authentication:
+    replication:
+      username: replicator
+      password: your_secure_password
+    superuser:
+      username: postgres
+      password: your_postgres_password
+  parameters:
+    unix_socket_directories: "/var/run/postgresql"
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+```
+
+Adapt for **pg-node-2** and **pg-node-3** (change `name` and IPs).
+
+Create systemd service (`/etc/systemd/system/patroni.service`):
+
+```ini
+[Unit]
+Description=Patroni (PostgreSQL HA)
+After=syslog.target network.target etcd.service
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+ExecStart=/usr/local/bin/patroni /etc/patroni/config.yml
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+TimeoutSec=30
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Start Patroni on **all nodes**:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable patroni
+sudo systemctl start patroni
+```
+
+**Verification:**
+
+```bash
+sudo systemctl status patroni
+
+# Check cluster status
+patronictl -c /etc/patroni/config.yml list
+```
+
+Expected output:
+
+```
++ Cluster: postgres-cluster (7234567890123456789) -----+----+-----------+
+| Member    | Host          | Role    | State   | TL | Lag in MB |
++-----------+---------------+---------+---------+----+-----------+
+| pg-node-1 | 192.168.1.10  | Leader  | running |  1 |           |
+| pg-node-2 | 192.168.1.11  | Replica | running |  1 |         0 |
+| pg-node-3 | 192.168.1.12  | Replica | running |  1 |         0 |
++-----------+---------------+---------+---------+----+-----------+
+```
+
+### Step 4: Verify Replication is Working
+
+**What this step accomplishes**: Prove data replicates from primary to replicas.
+
+On **pg-node-1** (primary), create test database:
+
+```bash
+sudo -u postgres psql
+```
+
+```sql
+CREATE DATABASE test_replication;
+\c test_replication
+
+CREATE TABLE replication_test (
+  id SERIAL PRIMARY KEY,
+  created_at TIMESTAMP DEFAULT NOW(),
+  data TEXT
+);
+
+INSERT INTO replication_test (data)
+VALUES ('This should replicate to standbys');
+
+SELECT * FROM replication_test;
+```
+
+On **pg-node-2** (replica):
+
+```bash
+sudo -u postgres psql -h 192.168.1.11 -U postgres test_replication
+```
+
+```sql
+SELECT * FROM replication_test;
+```
+
+**Expected**: You see the inserted row.
+
+Check replication lag:
+
+```sql
+SELECT
+  application_name,
+  client_addr,
+  state,
+  sync_state,
+  pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn) AS send_lag,
+  pg_wal_lsn_diff(sent_lsn, write_lsn) AS write_lag,
+  pg_wal_lsn_diff(write_lsn, flush_lsn) AS flush_lag,
+  pg_wal_lsn_diff(flush_lsn, replay_lsn) AS replay_lag
+FROM pg_stat_replication;
+```
+
+**Expected**: Low lag (< 1MB), state = `streaming`.
+
+### Step 5: Simulate Primary Failure
+
+**What this step accomplishes**: Test automatic failover when primary fails.
+
+Record current leader:
+
+```bash
+patronictl -c /etc/patroni/config.yml list
+# Note which node is "Leader"
+```
+
+On **pg-node-1** (current primary):
+
+```bash
+# Simulate crash
+sudo systemctl stop patroni
+```
+
+Wait 30-60 seconds, then check cluster status from **pg-node-2**:
+
+```bash
+patronictl -c /etc/patroni/config.yml list
+```
+
+**Expected output**: One of the replicas is now "Leader".
+
+Verify database is accessible:
+
+```bash
+# Connect to new primary (e.g., pg-node-2)
+sudo -u postgres psql -h 192.168.1.11 -U postgres test_replication
+
+SELECT * FROM replication_test;
+# Should still see data
+
+INSERT INTO replication_test (data) VALUES ('After failover');
+```
+
+Bring **pg-node-1** back online:
+
+```bash
+sudo systemctl start patroni
+```
+
+Check status—it should rejoin as a replica:
+
+```bash
+patronictl -c /etc/patroni/config.yml list
+```
+
+### Step 6: Configure Backups with pgBackRest
+
+**What this step accomplishes**: Set up automated backups and verify restore works.
+
+Install pgBackRest on **all nodes**:
+
+```bash
+sudo apt install -y pgbackrest
+```
+
+Configure pgBackRest on **pg-node-1** (`/etc/pgbackrest.conf`):
+
+```ini
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-retention-full=2
+log-level-console=info
+log-level-file=debug
+
+[postgres-cluster]
+pg1-path=/var/lib/postgresql/15/main
+pg1-port=5432
+pg1-socket-path=/var/run/postgresql
+```
+
+Create backup repository:
+
+```bash
+sudo mkdir -p /var/lib/pgbackrest
+sudo chown postgres:postgres /var/lib/pgbackrest
+sudo -u postgres pgbackrest --stanza=postgres-cluster stanza-create
+```
+
+Perform full backup:
+
+```bash
+sudo -u postgres pgbackrest --stanza=postgres-cluster --type=full backup
+```
+
+**Expected output**:
+
+```
+INFO: backup command begin
+INFO: execute non-exclusive pg_start_backup()
+INFO: backup start archive = 000000010000000000000004
+INFO: full backup size = 23MB
+INFO: backup command end: completed successfully
+```
+
+List backups:
+
+```bash
+sudo -u postgres pgbackrest --stanza=postgres-cluster info
+```
+
+### Step 7: Test Restore from Backup
+
+**What this step accomplishes**: Verify backups are usable for disaster recovery.
+
+On **pg-node-3**, stop Patroni and wipe data:
+
+```bash
+sudo systemctl stop patroni
+sudo rm -rf /var/lib/postgresql/15/main/*
+```
+
+Restore from backup:
+
+```bash
+sudo -u postgres pgbackrest --stanza=postgres-cluster --delta restore
+
+# Restart Patroni (will rejoin cluster)
+sudo systemctl start patroni
+```
+
+Verify node rejoined:
+
+```bash
+patronictl -c /etc/patroni/config.yml list
+```
+
+Check data is intact:
+
+```bash
+sudo -u postgres psql -h 192.168.1.12 test_replication
+SELECT * FROM replication_test;
+```
+
+## Verification
+
+### Testing the Complete System
+
+**Check cluster health:**
+
+```bash
+patronictl -c /etc/patroni/config.yml list
+```
+
+All nodes should show "running", one Leader, two Replicas.
+
+**Verify replication lag:**
+
+```sql
+-- On primary
+SELECT * FROM pg_stat_replication;
+```
+
+Lag should be < 1MB under normal load.
+
+**Test writes:**
+
+```sql
+-- On primary
+INSERT INTO replication_test (data)
+SELECT 'Test row ' || generate_series(1, 1000);
+
+-- On replica (within 1 second)
+SELECT count(*) FROM replication_test;
+```
+
+Count should match primary.
+
+**Check backup status:**
+
+```bash
+sudo -u postgres pgbackrest --stanza=postgres-cluster info
+```
+
+Should show recent successful backup.
+
+### Expected Behavior
+
+When working correctly:
+
+- All 3 nodes show `state: running` in patronictl
+- Replication lag < 1MB (check pg_stat_replication)
+- Failover completes within 30-60 seconds
+- Backups complete successfully
+- Restore brings node online as replica
+- No errors in `/var/log/postgresql/*.log`
+
+### Verification Checklist
+
+- [x] All 3 PostgreSQL nodes installed
+- [x] etcd cluster formed (3 members)
+- [x] Patroni running on all nodes
+- [x] One node is Leader, two are Replicas
+- [x] Data replicates (verified with test table)
+- [x] Failover works (primary stop → new leader elected)
+- [x] Backups configured and tested
+- [x] Restore tested and verified
+- [x] No replication lag warnings
+
+## Failure Test/Recovery
+
+### Common Failure Scenarios
+
+#### Scenario 1: Primary Database Crashes
+
+**How to simulate:**
+
+```bash
+# On current primary
+sudo pkill -9 postgres
+```
+
+**Expected behavior:**
+
+- Patroni detects failure within 10 seconds
+- New leader elected from replicas (30-60s)
+- Clients reconnect to new primary
+- Failed node rejoins as replica when restarted
+
+**Recovery steps:**
+
+1. Check logs: `sudo journalctl -u patroni -n 100`
+2. Verify new leader: `patronictl list`
+3. If node doesn&apos;t auto-recover:
+   ```bash
+   sudo systemctl restart patroni
+   ```
+
+#### Scenario 2: Network Partition (Split Brain)
+
+**How to simulate:**
+
+```bash
+# On pg-node-1, block other nodes
+sudo iptables -A INPUT -s 192.168.1.11 -j DROP
+sudo iptables -A INPUT -s 192.168.1.12 -j DROP
+```
+
+**Expected behavior:**
+
+- Isolated node loses leader status
+- Remaining 2 nodes elect new leader (have quorum)
+- Isolated node becomes "secondary without leader"
+
+**Recovery:**
+
+```bash
+# Restore network
+sudo iptables -F
+
+# Node should auto-rejoin as replica
+patronictl -c /etc/patroni/config.yml list
+```
+
+#### Scenario 3: Backup Corruption
+
+**How to simulate:**
+
+```bash
+sudo rm /var/lib/pgbackrest/backup/postgres-cluster/latest
+```
+
+**Handling:**
+
+- Run new full backup:
+  ```bash
+  sudo -u postgres pgbackrest --stanza=postgres-cluster --type=full backup
+  ```
+- Verify: `pgbackrest info`
+
+### Debugging Tips
+
+**Problem**: Patroni won&apos;t start
+
+- **Cause**: PostgreSQL data directory already exists
+- **Solution**: Remove old cluster:
+  ```bash
+  sudo systemctl stop patroni
+  sudo rm -rf /var/lib/postgresql/15/main/*
+  sudo systemctl start patroni
+  ```
+
+**Problem**: Replication lag increasing
+
+- **Cause**: Network bandwidth, disk I/O, or high write load
+- **Solution**: Check `pg_stat_replication`, increase `wal_keep_size`, monitor disk I/O
+- **Prevention**: Right-size VMs, use SSDs, tune PostgreSQL
+
+**Problem**: etcd cluster unhealthy
+
+- **Cause**: Misconfigured IPs, firewall blocking ports
+- **Solution**: Check `etcdctl endpoint health`, verify port 2379/2380 open
+- **Prevention**: Document IP plan, test connectivity before deploying
+
+## Monitoring Notes
+
+### What to Monitor
+
+**Key metrics to track:**
+
+- **Availability**: Is primary accepting writes? (check every 30s)
+- **Replication Lag**: Bytes behind primary (alert if > 10MB)
+- **Failover Events**: Count of leader changes
+- **Backup Success**: Last successful backup timestamp
+- **Connections**: Active connections vs max_connections
+
+### Logging Best Practices
+
+Configure PostgreSQL logging (`postgresql.conf`):
+
+```ini
+log_destination = 'stderr'
+logging_collector = on
+log_directory = '/var/log/postgresql'
+log_filename = 'postgresql-%Y-%m-%d.log'
+log_min_duration_statement = 1000  # Log queries > 1s
+log_connections = on
+log_disconnections = on
+log_replication_commands = on
+```
+
+Patroni logs location:
+
+```bash
+sudo journalctl -u patroni -f
+```
+
+### Alerting Recommendations
+
+**Critical alerts** (wake up at 2am):
+
+- Primary database down for > 2 minutes
+- All replicas offline
+- Backup failed for 2+ consecutive days
+- Replication completely stopped
+
+**Warning alerts** (check next business day):
+
+- Replication lag > 100MB
+- Disk usage > 80%
+- Connection count > 80% of max
+- Backup duration increasing significantly
+
+### Observability Tools
+
+**Prometheus + postgres_exporter:**
+
+```bash
+# Install postgres_exporter
+wget https://github.com/prometheus-community/postgres_exporter/releases/download/v0.12.0/postgres_exporter-0.12.0.linux-amd64.tar.gz
+tar xvfz postgres_exporter-*.tar.gz
+sudo mv postgres_exporter /usr/local/bin/
+
+# Create systemd service
+sudo systemctl enable postgres_exporter
+sudo systemctl start postgres_exporter
+```
+
+**Key metrics:**
+
+- `pg_up` - Is PostgreSQL running?
+- `pg_replication_lag` - Replication lag in bytes
+- `pg_stat_database_tup_inserted` - Write rate
+- `pg_stat_replication_state` - Replication state
+
+**Grafana dashboards:**
+
+- PostgreSQL Database (ID: 9628)
+- Patroni (ID: 13725)
+
+## Tradeoffs
+
+### Simplifications Made
+
+**For learning purposes, this tutorial simplified:**
+
+1. **No load balancer**: Production should use HAProxy/PgBouncer
+   - **When to upgrade**: > 10 clients or need connection pooling
+
+2. **Single backup location**: Production needs off-site backups
+   - **When to upgrade**: When data has real value
+
+3. **No SSL/TLS**: Production should encrypt replication
+   - **When to upgrade**: Immediately for production use
+
+4. **Simple firewall rules**: Production needs defense in depth
+   - **When to upgrade**: Before exposing to internet
+
+### Performance Tradeoffs
+
+**What was optimized:**
+
+- Fast failover (30-60s with these settings)
+- Low replication lag (< 1MB typically)
+- Simple to understand and debug
+
+**What wasn&apos;t optimized:**
+
+- Maximum throughput (could tune shared_buffers, work_mem)
+- Minimum resource usage (could reduce wal_keep_size)
+- Backup speed (could use parallel workers)
+
+**When performance becomes critical:**
+
+- Writes > 1000 TPS → tune checkpoint settings
+- Large database (> 100GB) → optimize backup strategy
+- Many clients → add connection pooler
+
+### Security Tradeoffs
+
+**Included security:**
+
+- Password authentication for replication
+- md5 authentication (should use scram-sha-256)
+- Restricted pg_hba.conf
+- Data checksums enabled
+
+**Omitted for simplicity:**
+
+- SSL/TLS encryption (add `ssl=on` + certificates)
+- Client certificate authentication
+- Audit logging
+- SELinux / AppArmor
+
+**Production security requirements:**
+
+- Enable SSL/TLS for all connections
+- Use scram-sha-256 authentication
+- Implement certificate-based auth
+- Enable audit logging
+- Firewall rules beyond pg_hba.conf
+- Regular security updates
+
+### Cost Tradeoffs
+
+**This tutorial uses:**
+
+- 3 VMs (≈ $30-60/month cloud, or free if local)
+- Simple backup storage (local disk)
+- No managed services
+
+**Production costs:**
+
+- Load balancer: +$10-20/month
+- Off-site backup storage: +$5-50/month
+- Monitoring (Grafana Cloud): +$0-49/month
+- Larger VMs for production: +$100-500/month
+
+**Cost optimization:**
+
+- Use smaller VMs for testing
+- Archive old backups to object storage
+- Self-host monitoring
+- Regional VMs cheaper than global
+
+## Next Steps
+
+### Enhancements
+
+Beyond this tutorial:
+
+1. **Add HAProxy for load balancing**
+   - Direct reads to replicas
+   - Automatic failover routing
+   - Connection pooling
+
+2. **Implement continuous archiving**
+   - Ship WAL to S3/MinIO
+   - Point-in-time recovery
+   - Longer retention
+
+3. **Set up logical replication**
+   - Cross-region replication
+   - Selective table replication
+   - Zero-downtime migrations
+
+4. **Add monitoring dashboards**
+   - Grafana with PostgreSQL datasource
+   - Alert rules in Alertmanager
+   - Custom SLO tracking
+
+### Production Readiness
+
+For production deployment:
+
+**Security:**
+
+- Enable SSL/TLS
+- Use certificate authentication
+- Implement network segmentation
+- Set up audit logging
+- Regular security patches
+
+**Performance:**
+
+- Tune PostgreSQL for workload
+- Add connection pooler (PgBouncer)
+- Optimize queries (EXPLAIN ANALYZE)
+- Benchmark with realistic load
+
+**Monitoring:**
+
+- Deploy Prometheus + Grafana
+- Configure Alertmanager
+- Create runbooks for alerts
+- Test notification channels
+
+**Disaster Recovery:**
+
+- Document restore procedures
+- Test restores quarterly
+- Off-site backup replication
+- Define RTO/RPO targets
+
+**Operations:**
+
+- Create on-call runbooks
+- Automate common tasks
+- Document architecture
+- Train team on procedures
+
+### Related Resources
+
+- **Official Docs**: [PostgreSQL Replication](https://www.postgresql.org/docs/current/high-availability.html)
+- **Patroni Docs**: [Patroni Documentation](https://patroni.readthedocs.io/)
+- **Community**: [PostgreSQL Slack](https://postgres-slack.herokuapp.com/)
+- **Source Code**: [Example configs on GitHub](https://github.com/patroni/patroni/tree/master/examples)
+
+---
+
+_Last updated: 2024-01-28_

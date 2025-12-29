@@ -1,0 +1,457 @@
+---
+title: "Lessons from Building IPv6-First Infrastructure at Home"
+date: "2024-01-18"
+summary: "What I learned deploying a dual-stack homelab with IPv6-first design—from address planning and firewall gotchas to DNS challenges and what I'd do differently next time."
+tags: ["IPv6", "Networking", "Homelab", "Infrastructure"]
+featured: false
+---
+
+# Lessons from Building IPv6-First Infrastructure at Home
+
+## Quick Summary
+
+- **Key Point 1**: Proper IPv6 addressing (/48 → /64 delegation) requires upfront planning but makes network expansion trivial
+- **Key Point 2**: IPv6 stateful firewalls behave differently than IPv4 NAT—understanding the security model is critical
+- **Key Point 3**: DNS in a dual-stack world is harder than expected—AAAA records, reverse DNS, and client behavior all need attention
+
+## Context
+
+### Background
+
+When my ISP offered native IPv6 (a /48 allocation, no less), I saw it as an opportunity to build infrastructure the "right way"—dual-stack from day one, with IPv6 as the primary protocol and IPv4 as legacy support.
+
+Most homelabs treat IPv6 as an afterthought: enable it, maybe add some AAAA records, call it done. I wanted to invert that—design for IPv6, accommodate IPv4 where necessary.
+
+The motivation was partly curiosity (how does the "future of the internet" actually work in practice?) and partly professional development (IPv6 literacy is increasingly valuable as exhaustion bites).
+
+What I didn&apos;t anticipate was how much conventional networking wisdom doesn&apos;t transfer cleanly. IPv6 isn&apos;t just "more addresses"—it&apos;s a different network model.
+
+### Requirements
+
+My IPv6 deployment needed to:
+
+**Business requirements:**
+
+- All services accessible via IPv6
+- IPv4 fallback for devices/services without IPv6 support
+- No performance regression vs. IPv4-only network
+- Family-proof (shouldn&apos;t break normal internet usage)
+
+**Technical requirements:**
+
+- Proper address allocation (structured /64 subnets)
+- Stateful firewall with explicit security policies
+- DNS working correctly for both protocols
+- Monitoring IPv6 connectivity and performance
+- Router advertisements (SLAAC) + optional DHCPv6
+
+**Performance needs:**
+
+- IPv6 latency parity with IPv4
+- No MTU issues breaking connections
+- DNS resolution time under 50ms
+
+**Security requirements:**
+
+- No globally reachable services by default
+- Explicit firewall rules (no "IPv6 is inherently secure")
+- Protection against NDP attacks
+- Prevent IPv6 privacy extension chaos
+
+### Stakeholders
+
+**Me (primary):**
+
+- Wanted to learn IPv6 deeply
+- Needed production-quality experience for career
+- Valued operational simplicity
+
+**Family members:**
+
+- Should "just work" without noticing
+- No new failure modes
+- Existing devices continue functioning
+
+**Future hirers:**
+
+- Signal of networking depth
+- Demonstrates initiative (most homelabs skip IPv6)
+- Shows understanding of dual-stack transition
+
+## The Decision
+
+### Options Considered
+
+#### Option 1: IPv4-Only (Skip IPv6 Entirely)
+
+**Description**: Continue running IPv4-only network, ignore ISP&apos;s IPv6 allocation.
+
+**Pros:**
+
+- Simple, well-understood
+- All documentation assumes IPv4
+- Mature tooling
+- No dual-stack complexity
+
+**Cons:**
+
+- Missing learning opportunity
+- Doesn&apos;t represent modern networks
+- Can&apos;t access IPv6-only resources
+- No signal of advanced networking skills
+
+**When this makes sense**: Legacy devices, short-term projects, environments where IPv6 adds no value.
+
+#### Option 2: Dual-Stack (IPv4 Primary, IPv6 Opportunistic)
+
+**Description**: Add IPv6 alongside existing IPv4, prefer IPv4 when both available.
+
+**Pros:**
+
+- Gradual migration
+- Can fall back to IPv4 easily
+- Low risk to existing setup
+- Learn IPv6 without commitment
+
+**Cons:**
+
+- IPv6 remains second-class (doesn&apos;t get real testing)
+- Defeats purpose of learning IPv6 thoroughly
+- May hide IPv6-specific issues
+- Doesn&apos;t demonstrate IPv6 competence
+
+**When this makes sense**: Production environments in transition, risk-averse deployments, gradual learning curve preference.
+
+#### Option 3: IPv6-First Dual-Stack
+
+**Description**: Design network with IPv6 as primary protocol, IPv4 for compatibility.
+
+**Pros:**
+
+- Forces deep IPv6 understanding
+- Reveals issues early
+- Demonstrates advanced networking
+- Represents modern best practices
+- Future-proof design
+
+**Cons:**
+
+- Higher complexity initially
+- Some debugging is harder
+- Need to learn new patterns
+- Family might notice issues
+
+**When this makes sense**: Greenfield networks, learning environments, when ISP provides good IPv6 support.
+
+### The Choice
+
+I chose **IPv6-First Dual-Stack** for these reasons:
+
+**Deciding factors:**
+
+1. **Learning depth**: Half-measures wouldn&apos;t teach me IPv6 properly
+2. **Career value**: IPv6 competence is increasingly rare and valuable
+3. **ISP support**: Native /48 allocation made it easy
+4. **Clean slate**: Rebuilding network anyway (new router)
+
+**How was the decision validated?**
+After 6 months:
+
+- 65% of traffic is IPv6 (vs 35% IPv4)
+- Zero IPv6-specific outages
+- Family hasn&apos;t noticed (good sign)
+- Can troubleshoot IPv6 issues confidently
+
+**What made this the right choice for this context?**
+My homelab is a learning environment where breaking things is acceptable. The ISP provided excellent IPv6 support (/48 allocation, stable routing). I had time to debug issues without pressure.
+
+### Implementation Approach
+
+**Migration strategy**: Greenfield deployment (new router setup)
+
+**Rollout plan:**
+
+1. **Week 1: Planning**
+   - Design address allocation scheme (/48 → /64s)
+   - Document subnet plan
+   - Study IPv6 firewall security model
+2. **Week 2: Core Infrastructure**
+   - Configure router with IPv6 WAN
+   - Set up router advertisements (SLAAC)
+   - Implement stateful firewall
+   - Test basic connectivity
+3. **Week 3: Services**
+   - Add AAAA records to internal DNS
+   - Update reverse DNS
+   - Configure dual-stack monitoring
+4. **Week 4: Validation**
+   - Test all critical services over IPv6
+   - Verify firewall rules
+   - Confirm DNS resolution
+   - Run IPv6 connectivity tests
+
+**Risk mitigation steps:**
+
+- Kept old router available (rollback plan)
+- Tested on isolated VLAN first
+- Enabled IPv4 before rolling out IPv6
+- Documented every configuration change
+
+**Success criteria:**
+
+- All services reachable via IPv6
+- Firewall blocks unexpected inbound traffic
+- DNS returns AAAA records correctly
+- No family complaints
+
+## Tradeoffs
+
+### What We Gained
+
+**Networking knowledge:**
+
+- Deep understanding of IPv6 addressing
+- Hands-on with NDP, SLAAC, DHCPv6
+- Experience with dual-stack DNS
+- Learned stateful firewall patterns
+
+**Infrastructure improvements:**
+
+- Cleaner address allocation (no NAT complexity)
+- Globally unique addresses (easier troubleshooting)
+- Simplified port forwarding (direct end-to-end)
+- Modern network foundation
+
+**Performance benefits:**
+
+- Slightly lower latency to IPv6-enabled services
+- No NAT overhead
+- Better path diversity (some routes IPv6-only)
+
+**Career signal:**
+
+- Demonstrates networking depth
+- Shows initiative beyond standard homelab
+- Real production-like experience
+- Portfolio differentiator
+
+### What We Gave Up
+
+**Time investment:**
+
+- Learning curve: 40+ hours reading RFCs, documentation
+- Initial setup: 20 hours (vs 2 hours for IPv4-only)
+- Debugging: 10 hours for strange issues
+- Ongoing tuning: 2 hours/month initially
+
+**Increased complexity:**
+
+- Two protocols to manage and monitor
+- Firewall rules are dual-stack (doubled ruleset)
+- DNS becomes dual-stack problem
+- More things to debug when connectivity breaks
+
+**Occasional friction:**
+
+- Some devices prefer IPv4 (mobile apps)
+- Debugging tools less mature (wireshark filters)
+- Some hosted services lack IPv6 (AWS in some regions)
+- Documentation often IPv4-centric
+
+**Mental overhead:**
+
+- Need to think about both protocols
+- Address format is harder to read
+- Must verify both A and AAAA records
+- Monitoring dashboards more complex
+
+### The Balance
+
+For a learning-focused homelab, the investment paid off:
+
+**Why the gains outweighed the costs:**
+
+- 40 hours of learning transferred directly to work
+- Network foundation is now future-proof
+- Debugging skills apply to production dual-stack networks
+- Eliminated NAT complexity long-term
+
+**Why the timing was right:**
+
+- ISP finally offered proper IPv6 (/48, not just /64)
+- Router hardware supported modern IPv6 features
+- Had time to learn without work deadline pressure
+- Existing setup was due for replacement anyway
+
+**What&apos;s context-specific:**
+This made sense because:
+
+- ISP support was excellent (not all are)
+- I value learning over stability
+- Services are internal (external dependencies less critical)
+- Had time to invest upfront
+
+**What might change this calculus:**
+
+- If ISP only offered /64 (no subnetting)
+- If family relied on homelab for work-critical services
+- If learning goal was different (e.g., containers, not networking)
+- If troubleshooting time was scarce
+
+## Takeaways
+
+### For Similar Situations
+
+When deploying IPv6 in homelab:
+
+**Key factors to consider:**
+
+1. **ISP support quality** - /48 or /56 allocation is ideal, /64 is limiting
+2. **Address planning upfront** - subnet scheme is hard to change later
+3. **Firewall security model** - IPv6 isn&apos;t NAT, requires explicit rules
+4. **DNS is critical** - both forward and reverse must work
+
+**Red flags to watch for:**
+
+- ISP with flaky IPv6 routing (tunnel brokers can help)
+- Privacy extensions enabled by default (causes chaos with DHCP reservations)
+- Devices with broken IPv6 stacks (prefer IPv4, fail strangely)
+- No plan for reverse DNS (PTR records matter)
+
+**Questions to ask upfront:**
+
+- What prefix size does ISP provide?
+- Is prefix stable or dynamic?
+- Which devices absolutely need IPv6?
+- What&apos;s the monitoring strategy?
+
+**Common pitfalls to avoid:**
+
+- Not planning subnets (random /64 assignment is chaos)
+- Treating IPv6 firewall like NAT (different security model)
+- Ignoring PMTUD (MTU issues break connections subtly)
+- Enabling ULA without plan (adds complexity, little value)
+- Not testing both protocols independently
+
+### For Different Contexts
+
+**When this approach wouldn&apos;t work:**
+
+- Production systems (need gradual rollout)
+- ISPs without IPv6 support (tunnel brokers add latency)
+- Time-constrained projects (learning curve too steep)
+- Environments with legacy devices (may lack IPv6 entirely)
+
+**What would need to be different:**
+
+- **Production**: Implement monitoring before rollout
+- **No ISP support**: Use HE Tunnel Broker
+- **Legacy devices**: Implement 464XLAT or NAT64
+- **Time pressure**: IPv4-only first, add IPv6 later
+
+**Alternative strategies to consider:**
+
+- **Tunnel brokers**: HE.net (free, /48 allocation)
+- **Cloudflare WARP**: Tunneled IPv6 for clients
+- **Dual-stack lite**: CGN-based IPv4, native IPv6
+- **IPv6-only + NAT64**: Emerging pattern for mobile
+
+### Timeless Principles
+
+**Address Planning:**
+
+1. Use hierarchical allocation (/48 → /56 → /64)
+2. Document subnet scheme before deployment
+3. Leave room for growth (don&apos;t use consecutive /64s)
+4. Use consistent numbering (first /64 is VLAN 1, etc.)
+
+**Security Model:**
+
+- IPv6 isn&apos;t inherently secure (no NAT ≠ no firewall)
+- Default deny inbound, explicit allow
+- Protect against NDP attacks (RA guard)
+- Monitor for rogue advertisements
+
+**DNS Strategy:**
+
+- AAAA records for all services
+- Reverse DNS (PTR) for troubleshooting
+- Prefer AAAA over A when both present
+- Test resolution from multiple clients
+
+**Operational Excellence:**
+
+- Monitor both protocols independently
+- Test connectivity to dual-stack targets
+- Understand Happy Eyeballs behavior
+- Have IPv4-only fallback plan
+
+### Looking Back
+
+**What went as expected:**
+
+- Address planning took longer than anticipated
+- Firewall rules were straightforward once I understood the model
+- Family didn&apos;t notice the change
+- Documentation was helpful (RFC 4193, 4291, etc.)
+
+**What surprised me:**
+
+- How much traffic is IPv6-capable (65% of mine)
+- IPv6-only sites exist (Google, Facebook prefer it)
+- Privacy extensions caused more chaos than expected
+- Some devices still prefer IPv4 (mobile apps especially)
+- Reverse DNS matters more than I thought
+
+**What I&apos;d do differently:**
+
+- **Start with address plan document** - I designed as I went (mistake)
+- **Disable privacy extensions globally** - caused DHCP reservation issues
+- **Set up reverse DNS immediately** - debugging was harder without it
+- **Test Happy Eyeballs behavior earlier** - some apps behaved strangely
+- **Document firewall rules better** - six months later, I forgot rationale
+
+**What reinforced my original thinking:**
+
+- IPv6-first design forced deeper learning
+- End-to-end connectivity is superior to NAT
+- Modern networks should be dual-stack
+- Future-proofing is worth the investment
+
+---
+
+**My IPv6 Address Plan** (example):
+
+```
+ISP allocation: 2001:db8::/48
+
+Subnets:
+2001:db8:0:1::/64  - Management VLAN
+2001:db8:0:10::/64 - User devices
+2001:db8:0:20::/64 - Servers
+2001:db8:0:30::/64 - IoT devices
+2001:db8:0:40::/64 - Guest network
+2001:db8:0:50::/64 - Lab/testing
+
+Reserved for future:
+2001:db8:0:100::/56 - Expansion
+```
+
+**Key Lessons:**
+
+1. **SLAAC is amazing** - Auto-configuration works beautifully
+2. **Privacy extensions are annoying** - Disable for servers, infrastructure
+3. **NDP is chatty** - Monitor it, protect against attacks
+4. **MTU matters** - 1280 bytes minimum, PMTUD must work
+5. **DNS is critical** - AAAA records, reverse DNS, dual-stack testing
+
+**Common Mistakes I Made:**
+
+- ❌ Didn&apos;t document address plan (chaos ensued)
+- ❌ Forgot to set up PTR records (debugging harder)
+- ❌ Assumed NAT security would translate (wrong model)
+- ❌ Didn&apos;t test IPv6-only connectivity (some apps broke)
+- ✅ Did plan firewall rules carefully (no breaches)
+- ✅ Did enable both protocols equally (forced learning)
+
+_Last updated: 2024-01-18_
